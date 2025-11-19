@@ -21,6 +21,10 @@ class Product(models.Model):
        default=Category.TRANSMISSION,
     )
     stock = models.IntegerField(default=0)
+    weight = models.DecimalField(max_digits=6, decimal_places=2, help_text="kg", default=0.0)  # kg
+    length = models.DecimalField(max_digits=6, decimal_places=2, help_text="cm", default=0.0)  # cm
+    width = models.DecimalField(max_digits=6, decimal_places=2, help_text="cm", default=0.0)   # cm
+    height = models.DecimalField(max_digits=6, decimal_places=2, help_text="cm", default=0.0)  # cm
     is_active = models.BooleanField(default=True)
 
     def save(self, *args, **kwargs):

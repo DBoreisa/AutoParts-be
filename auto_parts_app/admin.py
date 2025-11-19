@@ -49,7 +49,7 @@ class OrderAdmin(admin.ModelAdmin):
     search_fields = ("customer_name", "customer_email", "id")
     ordering = ("-created_at",)
     inlines = [OrderItemInline]
-    list_editable = ("status",) 
+    list_editable = ["status"] 
 
     fieldsets = (
         ("Customer Info", {
@@ -67,7 +67,7 @@ class OrderAdmin(admin.ModelAdmin):
             "fields": ("status", "total_price", "currency", "created_at")
         }),
     )
-    readonly_fields = ("created_at",)
+    readonly_fields = ("created_at", "total_price")
 
     # --- Custom action ---
     actions = ["mark_as_shipped"]
