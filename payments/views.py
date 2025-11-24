@@ -1,25 +1,81 @@
 from django.shortcuts import render
 import stripe
 import json
+import logging
+import requests
 from django.conf import settings
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from rest_framework.decorators import api_view
-
 from auto_parts_app.models import Product
 from auto_parts_app.models import Order, OrderItem 
 from auto_parts_app.utils import get_conversion_rate
 from decimal import Decimal, ROUND_HALF_UP
 
-import logging
+logger = logging.getLogger(__name__)
+stripe.api_key = settings.STRIPE_SECRET_KEY
+
+SENDPARCEL_API_KEY = settings.SP_API_KEY
+SENDPARCEL_BASE_URL = "https://sf6-api.sendparcel.com/rest-api"     # testinis domenas
+
+# Helper: Get SendParcel shipping price
+def get_sendparcel_price(total_weight, max_length, max_width, max_height, destination_country):
+    url = f"{SENDPARCEL_BASE_URL}/price/calc"  # sendparcel API base from settings/env
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": SENDPARCEL_API_KEY,
+    }
+
+    payload = {
+        "sender": {
+            "country": "LT"  # origin country
+        },
+        "receiver": {
+            "country": destination_country
+        },
+        "parcels": [
+            {
+                "count": 1,
+                "weight": float(total_weight),
+                "length": float(max_length),
+                "width": float(max_width),
+                "height": float(max_height),
+            }
+        ]
+    }
+
+    resp = requests.post(url, headers=headers, json=payload)
+    logger.info("SendParcel price calc request payload: %s", payload)
+    logger.info("SendParcel response status: %s, body: %s", resp.status_code, resp.text)
+
+    if resp.status_code != 200:
+        raise Exception(f"SendParcel API error {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+
+    # Example: assume SP returns a field "offers" with a list of { "price": ... }
+    # You need to adapt this based on the SP v2 API response schema.
+    offers = data.get("offers", None)
+    if offers:
+        # choose the cheapest offer
+        prices = [Decimal(str(o.get("price", "0"))) for o in offers]
+        if not prices:
+            raise Exception("No price in offers from SendParcel")
+        cheapest = min(prices)
+        return float(cheapest)
+
+    # Fallback if offers not present
+    price = data.get("price")
+    if price is not None:
+        return float(price)
+
+    raise Exception("SendParcel response missing price/offers")
+
 
 # STRIPE
 
 # checkout session endpoint
-
-logger = logging.getLogger(__name__)
-stripe.api_key = settings.STRIPE_SECRET_KEY
 
 @csrf_exempt
 @api_view(['POST'])
@@ -37,6 +93,40 @@ def create_checkout_session(request):
         
         rate = get_conversion_rate(conversion_currency)
 
+        # Calculate parcel dimensions & weight for SendParcel
+        total_weight = 0
+        max_length = 0
+        max_width = 0
+        max_height = 0
+
+        for item in cart:
+            product = Product.objects.get(id=item["id"])
+            qty = item["quantity"]
+
+            total_weight += float(product.weight) * qty
+
+            # use max per dimension
+            max_length = max(max_length, float(product.length))
+            max_width = max(max_width, float(product.width))
+            max_height = max(max_height, float(product.height))
+
+        # Destination country from frontend data (you need to send this from client)
+        destination_country = data.get("shipping_country", "LT")
+
+        # Get shipping price from SendParcel
+        try:
+            shipping_price_eur = get_sendparcel_price(
+                total_weight=total_weight,
+                max_length=max_length,
+                max_width=max_width,
+                max_height=max_height,
+                destination_country=destination_country
+            )
+        except Exception as e:
+            logger.exception("SendParcel price calculation failed")
+            return JsonResponse({"error": "Shipping API error", "detail": str(e)}, status=502)
+        
+        # Build Stripe line items
         line_items = []
         metadata_cart = []
 
@@ -46,7 +136,7 @@ def create_checkout_session(request):
             except Product.DoesNotExist:
                 logger.warning("Product ID %s not found, skipping", item.get("id"))
                 continue  # skip invalid product
-
+            
             base_price = product.sale_price if product.on_sale else product.price
             converted_price = int((base_price * Decimal(rate) * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
@@ -71,6 +161,25 @@ def create_checkout_session(request):
 
         if not line_items:
             return JsonResponse({"error": "Cart is empty or invalid"}, status=400)
+        
+        # Add shipping as a Stripe item
+        converted_shipping_cents = int((Decimal(shipping_price_eur) * Decimal(rate) * 100)
+                                        .to_integral_value(rounding=ROUND_HALF_UP))
+        line_items.append({
+            "price_data": {
+                "currency": currency,
+                "product_data": {"name": "Shipping (SendParcel)"},
+                "unit_amount": converted_shipping_cents,
+            },
+            "quantity": 1,
+        })
+
+        metadata_cart.append({
+            "id": "shipping",
+            "quantity": 1,
+            "price": int((Decimal(shipping_price_eur) * Decimal(rate))
+                         .to_integral_value(rounding=ROUND_HALF_UP))
+        })
 
         # Create Stripe checkout session
         session = stripe.checkout.Session.create(
