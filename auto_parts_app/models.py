@@ -57,6 +57,7 @@ class Order(models.Model):
     shipping_postal_code = models.CharField(max_length=20, default="00000")
     shipping_country = models.CharField(max_length=100, default="Unknown")
 
+    shipping_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     currency = models.CharField(max_length=10, default="EUR")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
