@@ -35,6 +35,7 @@ def create_checkout_session(request):
         conversion_currency = currency.upper()          # for Frankfurter
 
         logger.info("Cart received: %s", cart)
+        logger.info("Address received: %s", address)
 
         if not cart:
             return JsonResponse({"error": "Cart is empty"}, status=400)
@@ -84,7 +85,7 @@ def create_checkout_session(request):
             max_width = max(max_width, Decimal(str(product.width)))
             max_height = max(max_height, Decimal(str(product.height)))
 
-         # Get shipping price (handles timeouts and errors)
+        # Get shipping price (handles timeouts and errors)
         try:
             shipping_price_eur = calculate_shipping_price(
                 country=country,
@@ -150,6 +151,7 @@ def create_checkout_session(request):
         shipping_cents = int(
             (shipping_dec * rate_dec * Decimal("100")).to_integral_value(rounding=ROUND_HALF_UP)
         )
+
         line_items.append({
             "price_data": {
                 "currency": currency,
@@ -213,32 +215,51 @@ def stripe_webhook(request):
         if event["type"] == "checkout.session.completed":
             raw_session = event["data"]["object"]
 
-            # Extract customer info
-            customer_details = raw_session.get("customer_details") or {}
-            payment_method_details = raw_session.get("payment_method_details") or {}
-            billing_details = payment_method_details.get("billing_details") or {}
+            metadata = raw_session.get("metadata", {}) or {}
 
-            customer_email = customer_details.get("email") or billing_details.get("email") or "unknown@example.com"
-            customer_name = customer_details.get("name") or billing_details.get("name") or "Unknown"
-            customer_phone = (
-                customer_details.get("phone") or
-                billing_details.get("phone") or
-                "N/A"
-            )
+            try:
+                cart = json.loads(metadata.get("cart", "[]"))
+            except Exception:
+                logger.exception("Failed to get cart metadata")
+                cart = []
+
+            try:
+                shipping_data = json.loads(metadata.get("shipping_address", "{}"))
+            except Exception:
+                logger.exception("Failed to get shipping address metadata")
+                shipping_data = {}
+
+            try:
+                shipping_price = Decimal(metadata.get("shipping_price", "0"))
+            except Exception:
+                shipping_price = Decimal("0")
+
+             # Customer info from Stripe 
+            customer_details = raw_session.get("customer_details") or {}
+            customer_email = customer_details.get("email") or "unknown@example.com"
+            customer_name = customer_details.get("name") or "Unknown"
+            customer_phone = customer_details.get("phone") or "N/A"
 
             total_price = raw_session.get("amount_total", 0) / 100
             currency = raw_session.get("currency", "eur").upper()
 
-            # Shipping
-            shipping_info = raw_session.get("shipping_details") or {}
-            address = shipping_info.get("address") or customer_details.get("address") or billing_details.get("address") or {}
+            # Shipping address: use ONLY our metadata 
+            shipping_address = ", ".join(
+                filter(
+                    None,
+                    [
+                        shipping_data.get("street"),
+                        shipping_data.get("city"),
+                        shipping_data.get("postal_code"),
+                        shipping_data.get("country"),
+                    ],
+                )
+            )
+            shipping_city = shipping_data.get("city")
+            shipping_postal_code = shipping_data.get("postal_code")
+            shipping_country = shipping_data.get("country")
 
-            shipping_address = ", ".join(filter(None, [address.get("line1"), address.get("line2"), address.get("city")])) 
-            shipping_city = address.get("city")
-            shipping_postal_code = address.get("postal_code")
-            shipping_country = address.get("country")
-
-            # Create the order
+            # Create Order in DB
             order = Order.objects.create(
                 customer_name=customer_name,
                 customer_email=customer_email,
@@ -252,33 +273,32 @@ def stripe_webhook(request):
                 shipping_country=shipping_country,
             )
 
-            # Save items from metadata
-            try:
-                cart = json.loads(raw_session.get("metadata", {}).get("cart", "[]"))
-            except Exception:
-                logger.error("Failed to parse cart metadata from stripe session")
-                cart = []
-
+            # Create OrderItems in DB 
             for item in cart:
                 item_id = item.get("id")
+                if item_id == "shipping":
+                    continue
+
                 try:
                     product = Product.objects.get(id=item_id)
-                    quantity = int(item.get("quantity", 1) or 1)
-                    price_at_purchase = item.get("price", 0)
-
-                    OrderItem.objects.create(
-                        order=order,
-                        product=product,
-                        quantity=quantity,
-                        price_at_purchase=price_at_purchase
-                    )
-
-                    # decrement stock 
-                    if hasattr(product, "stock") and product.stock is not None:
-                        product.stock = max(0, product.stock - quantity)
-                        product.save()
                 except Product.DoesNotExist:
                     logger.warning("Product ID %s not found during webhook", item_id)
+                    continue
+
+                quantity = int(item.get("quantity", 1) or 1)
+                price_at_purchase = item.get("price", 0)
+
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    quantity=quantity,
+                    price_at_purchase=price_at_purchase,
+                )
+
+                # decrement stock
+                if hasattr(product, "stock") and product.stock is not None:
+                    product.stock = max(0, product.stock - quantity)
+                    product.save()
 
     except Exception as e:
         logger.exception("Error processing Stripe webhook: %s", str(e))

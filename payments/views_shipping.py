@@ -36,7 +36,7 @@ def calculate_shipping_price(country, city, postal_code, weight, length, width, 
             },
             "recipient": {
                 "is_a_company": False,
-                "country": country[:2].upper() if len(country) > 2 else country,  # ISO code
+                "country": country,  # ISO code
                 "postal_code": postal_code or "",
                 "city": city or "unknown",
             },
