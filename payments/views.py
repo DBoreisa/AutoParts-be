@@ -30,6 +30,7 @@ def create_checkout_session(request):
     try:
         data = json.loads(request.body)
         cart = data.get("cart", [])
+        address = data.get("address", {})
         currency = data.get("currency", "eur").lower()  # for Stripe
         conversion_currency = currency.upper()          # for Frankfurter
 
@@ -37,11 +38,24 @@ def create_checkout_session(request):
 
         if not cart:
             return JsonResponse({"error": "Cart is empty"}, status=400)
+    
+        # Validate address
+        country = address.get("country")
+        city = address.get("city")
+        postal_code = address.get("postal_code")
+
+        if not country or not city or not postal_code:
+            logger.error("Missing shipping address: %s", address)
+            return JsonResponse({"error": "Missing shipping address"}, status=400)
         
-        # Ensure SendParcel key exists
+        # Ensure API keys exist
         if not SENDPARCEL_API_KEY:
             logger.error("SENDPARCEL_API_KEY not configured")
             return JsonResponse({"error": "Shipping configuration missing"}, status=502)
+        
+        if not STRIPE_KEY:
+            logger.error("STRIPE_SECRET_KEY missing")
+            return JsonResponse({"error": "Stripe not configured"}, status=502)
         
         # Get conversion rate (Frankfurter)
         rate = get_conversion_rate(conversion_currency)
@@ -70,13 +84,12 @@ def create_checkout_session(request):
             max_width = max(max_width, Decimal(str(product.width)))
             max_height = max(max_height, Decimal(str(product.height)))
 
-        destination_country = data.get("shipping_country", "LT")
-
          # Get shipping price (handles timeouts and errors)
         try:
             shipping_price_eur = calculate_shipping_price(
-                country=destination_country,
-                postal_code=data.get("shipping_postal_code", ""),
+                country=country,
+                city=city,
+                postal_code=postal_code,
                 weight=total_weight,
                 length=max_length,
                 width=max_width,
@@ -84,7 +97,7 @@ def create_checkout_session(request):
                 value_eur=0,
             )
         except Exception as exc:
-            logger.exception("SendParcel price calculation failed")
+            logger.exception("SendParcel failed")
             return JsonResponse({"error": "Shipping API error", "detail": str(exc)}, status=502)
 
         # Stripe line items
@@ -102,7 +115,7 @@ def create_checkout_session(request):
                 logger.warning("Product ID %s not found, skipping", item_id)
                 continue
 
-            base_price = product.sale_price if getattr(product, "on_sale", False) else product.price
+            base_price = product.sale_price if product.on_sale else product.price
             price_dec = Decimal(str(base_price))
 
             converted_price_cents = int(
@@ -134,14 +147,14 @@ def create_checkout_session(request):
         
         # Add shipping as a Stripe item
         shipping_dec = Decimal(str(shipping_price_eur))
-        converted_shipping_cents = int(
+        shipping_cents = int(
             (shipping_dec * rate_dec * Decimal("100")).to_integral_value(rounding=ROUND_HALF_UP)
         )
         line_items.append({
             "price_data": {
                 "currency": currency,
-                "product_data": {"name": "Shipping (SendParcel)"},
-                "unit_amount": converted_shipping_cents,
+                "product_data": {"name": "Shipping"},
+                "unit_amount": shipping_cents,
             },
             "quantity": 1,
         })
@@ -153,11 +166,6 @@ def create_checkout_session(request):
             )
         })
 
-        # Ensure stripe API key exists before creating session
-        if not getattr(stripe, "api_key", None):
-            logger.error("Stripe API key not configured")
-            return JsonResponse({"error": "Payment gateway not configured"}, status=502)
-
         # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -165,19 +173,12 @@ def create_checkout_session(request):
             mode="payment",
             success_url="https://gearpro01e.com/?payment=success",
             cancel_url="https://gearpro01e.com/?payment=failed",
-            shipping_address_collection={
-                "allowed_countries": [
-                    # Amerika
-                    "US", "CA",
-                    # EU
-                    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE",
-                    "IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE",
-                    # Other 
-                    "NO","CH","IS", "GB"  
-                ],
-            },
             phone_number_collection={"enabled": True},
-            metadata={"cart": json.dumps(metadata_cart)}
+            metadata={
+                "cart": json.dumps(metadata_cart),
+                "shipping_address": json.dumps(address),  # store frontend address
+                "shipping_price": str(shipping_dec),      # store fixed shipping price
+            }
         )
 
         logger.info("Stripe session created: %s", getattr(session, "id", "unknown"))
@@ -209,7 +210,7 @@ def stripe_webhook(request):
         return HttpResponse(status=400)
 
     try:
-        if event.get["type"] == "checkout.session.completed":
+        if event["type"] == "checkout.session.completed":
             raw_session = event["data"]["object"]
 
             # Extract customer info

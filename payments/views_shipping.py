@@ -59,7 +59,7 @@ def calculate_shipping_price(country, city, postal_code, weight, length, width, 
     
     try:
         logger.debug("SendParcel payload: %s", json.dumps(payload))
-        resp = requests.post(url, json=payload, headers=headers, timeout=8)
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 15)) # 5s connect 20s read
         resp.raise_for_status()
     except requests.exceptions.Timeout:
         logger.exception("SendParcel request timed out")
