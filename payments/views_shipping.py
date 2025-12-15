@@ -16,8 +16,11 @@ SENDPARCEL_BASE_URL = getattr(settings, "SENDPARCEL_BASE_URL", "https://sf6-api.
 
 def calculate_shipping_price(country, city, postal_code, weight, length, width, height, value_eur=0):
     """
-    Calls SendParcel /quotes endpoint and returns the cheapest shipping price (EUR).
-    Raises Exception on failure.
+    Calls SendParcel /quotes endpoint and returns:
+    {
+        "amount": Decimal,   # total shipping price (EUR)
+        "product_id": int    # SendParcel product.id for /orders/creates
+    }
     """
     if not SENDPARCEL_API_KEY:
         raise Exception("SendParcel API key not configured")
@@ -80,13 +83,28 @@ def calculate_shipping_price(country, city, postal_code, weight, length, width, 
         logger.error("SendParcel response missing 'offers': %s", data)
         raise Exception("No shipping offers returned by SendParcel")
 
-    price_info = offers[0].get("price", {})
+    first_offer = offers[0]
+
+    # product.id – this is what /orders/creates expects as product_id
+    product_info = first_offer.get("product") or {}
+    product_id = product_info.get("id")
+
+    # total_price.amount – full shipping cost (you can switch to "price" if you prefer net)
+    price_info = first_offer.get("total_price") or first_offer.get("price") or {}
     amount = price_info.get("amount")
+
     if amount is None:
-        logger.error("SendParcel offer missing price: %s", offers[0])
+        logger.error("SendParcel offer missing price: %s", first_offer)
         raise Exception("Invalid price from SendParcel")
 
-    return Decimal(str(amount))
+    if product_id is None:
+        logger.error("SendParcel offer missing product.id: %s", first_offer)
+        raise Exception("Missing SendParcel product id")
+
+    return {
+        "amount": Decimal(str(amount)),
+        "product_id": product_id,
+    }
 
 @csrf_exempt
 @api_view(['POST'])
@@ -142,9 +160,136 @@ def get_shipping_quote(request):
             logger.exception("Failed to calculate shipping price")
             return JsonResponse({"error": "Shipping provider error", "detail": str(exc)}, status=502)
 
-        return JsonResponse({"shipping_price": shipping_price})
+        return JsonResponse({"shipping_price": shipping_price}) ###############################
+    
     except Exception as e:
         logger.exception("Error in get_shipping_quote")
         return JsonResponse({"error": str(e)}, status=500)
 
         
+def create_sendparcel_shipment(order, shipping_address, parcels, total_value_eur, product_id):
+    """
+    Create an actual shipment in SendParcel account after payment.
+
+    order            -> Order instance from your DB
+    shipping_address -> dict with: country, city, postal_code, street (from Stripe metadata)
+    parcels          -> list of {weight, length, width, height}
+    total_value_eur  -> Decimal total goods value (optional, can be None)
+    product_id       -> SendParcel product.id from /quotes
+    """
+    if not SENDPARCEL_API_KEY:
+        logger.error("SendParcel API key not configured; cannot create shipment")
+        return
+    
+    url = f"{SENDPARCEL_BASE_URL}/orders/creates"
+
+    country = (shipping_address.get("country") or "").upper()
+    city = shipping_address.get("city") or ""
+    postal_code = shipping_address.get("postal_code") or ""
+    street = shipping_address.get("street") or ""
+    phone = shipping_address.get("phone") or ""
+    email = shipping_address.get("email") or order.customer_email
+
+    # If total_value_eur is not passed, fall back to order.total_price
+    try:
+        value_number = float(total_value_eur or order.total_price or 0)
+    except Exception:
+        value_number = 0.0
+
+    # pickup date: "today". can set this from settings/env
+    from datetime import date
+    pickup_date = getattr(
+        settings,
+        "SENDPARCEL_PICKUP_DATE",
+        date.today().isoformat()
+    )
+
+    payload = {
+        "orderCreate": {
+            "packageType": "c_deze",
+            "value": value_number,
+            "product_id": int(product_id) if product_id is not None else getattr(settings, "SENDPARCEL_PRODUCT_ID", ""), # SENDPARCEL_PRODUCT_ID can be configured in settings
+            "insurance": "",  
+            "contents": f"Auto parts order #{order.id}",
+
+            "pickup": {
+                "date": pickup_date,
+            },
+
+            "shipper": {
+                "name": getattr(settings, "SENDER_NAME", "GearPro"),
+                "companyName": getattr(settings, "SENDER_COMPANY_NAME", "GearPro"),
+                "companyEcode": getattr(settings, "SENDER_COMPANY_ECODE", ""),
+                "companyTcode": getattr(settings, "SENDER_COMPANY_TCODE", ""),
+                "eoriNumber": getattr(settings, "SENDER_EORI_NUMBER", ""),
+                "country": getattr(settings, "SENDER_COUNTRY", "LT"),
+                "postal_code": getattr(settings, "SENDER_POSTAL_CODE", "59136"),
+                "city": getattr(settings, "SENDER_CITY", "Prienai"),
+                "address1": getattr(settings, "SENDER_ADDRESS1", ""),
+                "address2": getattr(settings, "SENDER_ADDRESS2", ""),
+                "phone": getattr(settings, "SENDER_PHONE", ""),
+                "email": getattr(settings, "SENDER_EMAIL", ""),
+                "terminalid": getattr(settings, "SENDER_TERMINAL_ID", ""),
+                "state": getattr(settings, "SENDER_STATE", ""),
+            },
+
+            "recipient": {
+                "name": order.customer_name,
+                "companyName": "",
+                "companyEcode": "",
+                "companyTcode": "",
+                "eoriNumber": "",
+                "country": country,
+                "postal_code": postal_code,
+                "city": city,
+                "address1": street,
+                "address2": "",
+                "phone": phone or order.customer_phone or "",
+                "email": email,
+                "terminalid": "",
+                "state": "",
+            },
+
+            "parcels": [
+                {
+                    "weight": float(p["weight"]),
+                    "length": float(p["length"]),
+                    "width": float(p["width"]),
+                    "height": float(p["height"]),
+                }
+                for p in parcels
+            ],
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "password": SENDPARCEL_API_KEY,
+    }
+
+    try:
+        logger.debug("SendParcel payload (orderCreate): %s", json.dumps(payload))
+        resp = requests.post(url, json=payload, headers=headers, timeout=(5, 30))
+        resp.raise_for_status()
+    except requests.exceptions.Timeout:
+        logger.exception("SendParcel ORDER request timed out")
+        # Don't break Stripe webhook
+        return
+    except requests.exceptions.RequestException as exc:
+        logger.exception("SendParcel ORDER request failed: %s", exc)
+        return
+    
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.error("SendParcel ORDER returned non-JSON: %s", resp.text[:200])
+        return
+    
+    # At this point order is successfully placed in SendParcel
+    logger.info(
+        "SendParcel shipment created for order %s: id=%s tracking=%s",
+        order.id,
+        data.get("id"),
+        data.get("tracking_number"),
+    )

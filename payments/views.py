@@ -9,7 +9,11 @@ from rest_framework.decorators import api_view
 from auto_parts_app.models import Product, Order, OrderItem 
 from auto_parts_app.utils import get_conversion_rate
 from decimal import Decimal, ROUND_HALF_UP
-from payments.views_shipping import calculate_shipping_price
+
+from payments.views_shipping import (
+    calculate_shipping_price,
+    create_sendparcel_shipment,   
+)
 
 import logging
 
@@ -67,6 +71,7 @@ def create_checkout_session(request):
         max_length = Decimal("0")
         max_width = Decimal("0")
         max_height = Decimal("0")
+        total_value_eur = Decimal("0")
 
         for item in cart:
             item_id = item.get("id")
@@ -85,9 +90,11 @@ def create_checkout_session(request):
             max_width = max(max_width, Decimal(str(product.width)))
             max_height = max(max_height, Decimal(str(product.height)))
 
-        # Get shipping price (handles timeouts and errors)
+            total_value_eur += Decimal(str(product.price)) * qty
+
+        # Get shipping price + product_id from SendParcel
         try:
-            shipping_price_eur = calculate_shipping_price(
+            shipping_quote = calculate_shipping_price(
                 country=country,
                 city=city,
                 postal_code=postal_code,
@@ -95,8 +102,10 @@ def create_checkout_session(request):
                 length=max_length,
                 width=max_width,
                 height=max_height,
-                value_eur=0,
+                value_eur=float(total_value_eur),
             )
+            shipping_price_eur = shipping_quote["amount"]
+            sendparcel_product_id = shipping_quote["product_id"]
         except Exception as exc:
             logger.exception("SendParcel failed")
             return JsonResponse({"error": "Shipping API error", "detail": str(exc)}, status=502)
@@ -180,6 +189,8 @@ def create_checkout_session(request):
                 "cart": json.dumps(metadata_cart),
                 "shipping_address": json.dumps(address),  # store frontend address
                 "shipping_price": str(shipping_dec),      # store fixed shipping price
+                "goods_value_eur": str(total_value_eur),       # total goods value in EUR
+                "sendparcel_product_id": str(sendparcel_product_id),
             }
         )
 
@@ -217,12 +228,14 @@ def stripe_webhook(request):
 
             metadata = raw_session.get("metadata", {}) or {}
 
+            # Cart metadata from create_checkout_session
             try:
                 cart = json.loads(metadata.get("cart", "[]"))
             except Exception:
                 logger.exception("Failed to get cart metadata")
                 cart = []
 
+            # Shipping address metadata from frontend
             try:
                 shipping_data = json.loads(metadata.get("shipping_address", "{}"))
             except Exception:
@@ -233,6 +246,13 @@ def stripe_webhook(request):
                 shipping_price = Decimal(metadata.get("shipping_price", "0"))
             except Exception:
                 shipping_price = Decimal("0")
+
+            try:
+                goods_value_eur = Decimal(metadata.get("goods_value_eur", "0"))
+            except Exception:
+                goods_value_eur = Decimal("0")
+
+            sendparcel_product_id = metadata.get("sendparcel_product_id")
 
              # Customer info from Stripe 
             customer_details = raw_session.get("customer_details") or {}
@@ -273,7 +293,14 @@ def stripe_webhook(request):
                 shipping_country=shipping_country,
             )
 
-            # Create OrderItems in DB 
+            # Create OrderItems in DB and recompute parcels for SendParcel
+            from decimal import Decimal as D
+
+            total_weight = D("0")
+            max_length = D("0")
+            max_width = D("0")
+            max_height = D("0")
+
             for item in cart:
                 item_id = item.get("id")
                 if item_id == "shipping":
@@ -299,6 +326,44 @@ def stripe_webhook(request):
                 if hasattr(product, "stock") and product.stock is not None:
                     product.stock = max(0, product.stock - quantity)
                     product.save()
+
+                # accumulate shipping params
+                if getattr(product, "weight", None) is not None:
+                    total_weight += D(str(product.weight)) * quantity
+                if getattr(product, "length", None) is not None:
+                    max_length = max(max_length, D(str(product.length)))
+                if getattr(product, "width", None) is not None:
+                    max_width = max(max_width, D(str(product.width)))
+                if getattr(product, "height", None) is not None:
+                    max_height = max(max_height, D(str(product.height)))
+
+            # Build parcels list for SendParcel
+            parcels = [{
+                "weight": float(total_weight or D("0")),
+                "length": float(max_length or D("0")),
+                "width": float(max_width or D("0")),
+                "height": float(max_height or D("0")),
+            }]
+
+            # Prepare shipping address dict for SendParcel
+            sendparcel_shipping_address = {
+                **shipping_data,
+                "phone": customer_phone,
+                "email": customer_email,
+            }
+
+            # Create SendParcel shipment
+            try:
+                create_sendparcel_shipment(
+                    order=order,
+                    shipping_address=sendparcel_shipping_address,
+                    parcels=parcels,
+                    total_value_eur=goods_value_eur,
+                    product_id=sendparcel_product_id,
+                )
+            except Exception:
+                # Don't fail webhook if SendParcel fails – just log
+                logger.exception("Failed to create SendParcel shipment for order %s", order.id)
 
     except Exception as e:
         logger.exception("Error processing Stripe webhook: %s", str(e))
