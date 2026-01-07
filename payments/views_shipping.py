@@ -12,7 +12,7 @@ from auto_parts_app.models import Product
 logger = logging.getLogger("payments")
 
 SENDPARCEL_API_KEY = getattr(settings, "SENDPARCEL_API_KEY", None)
-SENDPARCEL_BASE_URL = getattr(settings, "SENDPARCEL_BASE_URL", "https://sf6-api.sendparcel.com/rest-api") 
+SENDPARCEL_BASE_URL = getattr(settings, "SENDPARCEL_BASE_URL", "https://api.sendparcel.com/rest-api") 
 
 def calculate_shipping_price(country, city, postal_code, weight, length, width, height, value_eur=0):
     """
