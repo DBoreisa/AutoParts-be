@@ -292,7 +292,6 @@ def stripe_webhook(request):
                 shipping_city=shipping_city,
                 shipping_postal_code=shipping_postal_code,
                 shipping_country=shipping_country,
-                email_sent=False,
             )
 
             # Emails
@@ -309,7 +308,7 @@ def stripe_webhook(request):
                         f"We will contact you when your order is shipped.\n\n"
                         f"GearPro Team"
                     ),
-                    from_email=None,  # uses DEFAULT_FROM_EMAIL
+                    from_email="info@gearpro01e.com", 
                     recipient_list=[customer_email],
                 )
 
@@ -324,7 +323,7 @@ def stripe_webhook(request):
                         f"Phone: {customer_phone}\n"
                         f"Total: {total_price} {currency}"
                     ),
-                    from_email=None,
+                    from_email="info@gearpro01e.com",
                     recipient_list=["info@gearpro01e.com"],
                 )
 
