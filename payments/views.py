@@ -5,6 +5,7 @@ from django.conf import settings
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
+from django.core.mail import send_mail
 
 from auto_parts_app.models import Product, Order, OrderItem 
 from auto_parts_app.utils import get_conversion_rate
@@ -291,7 +292,44 @@ def stripe_webhook(request):
                 shipping_city=shipping_city,
                 shipping_postal_code=shipping_postal_code,
                 shipping_country=shipping_country,
+                email_sent=False,
             )
+
+            # Emails
+
+            try:
+                # Email to customer
+                send_mail(
+                    subject=f"Order #{order.id} confirmation – GearPro",
+                    message=(
+                        f"Hi {customer_name},\n\n"
+                        f"Thank you for your purchase!\n\n"
+                        f"Order ID: {order.id}\n"
+                        f"Total: {total_price} {currency}\n\n"
+                        f"We will contact you when your order is shipped.\n\n"
+                        f"GearPro Team"
+                    ),
+                    from_email=None,  # uses DEFAULT_FROM_EMAIL
+                    recipient_list=[customer_email],
+                )
+
+                # Email to admin
+                send_mail(
+                    subject=f"New order #{order.id}",
+                    message=(
+                        f"New order received\n\n"
+                        f"Order ID: {order.id}\n"
+                        f"Customer: {customer_name}\n"
+                        f"Email: {customer_email}\n"
+                        f"Phone: {customer_phone}\n"
+                        f"Total: {total_price} {currency}"
+                    ),
+                    from_email=None,
+                    recipient_list=["info@gearpro01e.com"],
+                )
+
+            except Exception:
+                logger.exception("Failed to send order emails")
 
             # Create OrderItems in DB and recompute parcels for SendParcel
             from decimal import Decimal as D
