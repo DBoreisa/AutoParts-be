@@ -28,7 +28,7 @@ The API provides endpoints for managing vehicles and auto parts and serves data 
 
 Frontend repository:
 
-👉 https://github.com/DBoreisa/AutoParts-frontend
+👉 https://github.com/DBoreisa/AutoParts
 
 ---
 
