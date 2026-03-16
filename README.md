@@ -1,9 +1,44 @@
-AutoParts – Full-Stack Auto Parts Store
+# AutoParts Backend
 
-A full-stack web application for managing and selling automobile parts.
-The system allows users to browse parts, add them to a cart, and manage their accounts, while administrators can manage inventory and product listings.
+Backend API for the **AutoParts system**, built with Django and Django REST Framework.
 
-This project demonstrates a typical e-commerce architecture with a database, backend logic, and frontend UI.
+The API provides endpoints for managing vehicles and auto parts and serves data to the React frontend.
+
+---
+
+## Tech Stack
+
+* Django
+* Django REST Framework
+* MySQL
+* Gunicorn
+* REST API
+
+---
+
+## Features
+
+* RESTful API endpoints
+* Database integration
+* Admin panel for data management
+
+---
+
+## Frontend Application
+
+Frontend repository:
+
+👉 https://github.com/DBoreisa/AutoParts-frontend
+
+---
+
+
+## Future Improvements
+
+* Authentication with JWT
+* API documentation with Swagger
+
+---
 
 "Add to cart" button disabled at the moment, becouse sells are stoped. Payment system works.
 
